@@ -4,11 +4,32 @@ Entry point is **main.ps1**
 
 * Installs winsdk debugger tools to default location ${env:ProgramFiles(x86)}
 * Copies all *.pdb from the project folder to a single, working folder
-* Edits the pdb's to use http paths using a modified [github-sourceindexer.ps1](https://github.com/Haemoglobin/GitHub-Source-Indexer) script
+* Works out each pdb's store key with **symstore.exe /x** and drops the ones the bucket already has
+* Edits the remaining pdb's to use http paths using a modified [github-sourceindexer.ps1](https://github.com/Haemoglobin/GitHub-Source-Indexer) script
 * Runs microsoft's **symstore.exe** on the .pdb files
 * Uploads output to the s3 bucket using AWS_SYMB_ACCESS_KEY_ID and AWS_SYMB_SECRET_ACCESS_KEY system env vars
 
 **The working directory needs to able to find partner scripts at .\here**
+
+## Skipping symbols the store already has
+
+A pdb's store key is its name plus the signature guid and age the compiler stamped into it, so the
+same binary always lands on the same key. Rather than recompressing and reuploading pdb's that are
+already there, the script asks the bucket first and only does the expensive work on what is missing.
+
+The lookup fails open - if it cannot reach the bucket, or symstore cannot index, every pdb is
+uploaded exactly as it was before. Pass **-forceUpload** to skip the lookup entirely.
+
+Pdb's with an all-F signature are dropped. symstore writes that when it cannot read a signature out
+of the file, which is the case for static library compile pdb's - no binary's debug directory points
+at one, so nothing can ever look the key up. `vc140.pdb` through `vc143.pdb` are dropped by name for
+the same reason. Add more with **-excludePdbNames** (accepts wildcards, e.g. `'moc.pdb,Qt6Example*.pdb'`).
+
+## Debug output
+
+Set the **SYMSRV_DEBUG=1** environment variable, or pass **-debugOutput**, to turn on verbose source
+indexing and `aws --debug`. Both are off by default - the aws debug log alone runs to tens of
+thousands of lines per build.
 
 # Examples
 

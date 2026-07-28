@@ -117,39 +117,74 @@ function CheckDebuggingToolsPath {
 
 ###############################################################
 
+# Github url's are case sensitive, so every source path has to be rewritten with the casing the
+# file actually has on disk. Listing each parent directory once and reusing it keeps that from
+# costing a filesystem glob per source line - large pdb's reference hundreds of thousands.
+$directoryCache = @{}
+
+function GetCanonicalPath {
+  param([string] $path)
+
+  $directory = [System.IO.Path]::GetDirectoryName($path)
+  if ([String]::IsNullOrEmpty($directory)) {
+    return $null
+  }
+
+  if (!$directoryCache.ContainsKey($directory)) {
+    $names = New-Object 'System.Collections.Generic.Dictionary[string,string]' (,[StringComparer]::OrdinalIgnoreCase)
+
+    if ([System.IO.Directory]::Exists($directory)) {
+      foreach ($file in [System.IO.Directory]::GetFiles($directory)) {
+        $names[[System.IO.Path]::GetFileName($file)] = $file
+      }
+    }
+
+    $directoryCache[$directory] = $names
+  }
+
+  $canonical = $null
+  if ($directoryCache[$directory].TryGetValue([System.IO.Path]::GetFileName($path), [ref] $canonical)) {
+    return $canonical
+  }
+
+  return $null
+}
+
+###############################################################
+
 function WriteStreamHeader {
-  param ([string] $streamPath)
-  
+  param ([System.Text.StringBuilder] $stream)
+
   Write-Verbose "Preparing stream header section..."
 
-  Add-Content -value "SRCSRV: ini ------------------------------------------------" -path $streamPath
-  Add-Content -value "VERSION=1" -path $streamPath
-  Add-Content -value "INDEXVERSION=2" -path $streamPath
-  Add-Content -value "VERCTL=Archive" -path $streamPath
-  Add-Content -value ("DATETIME=" + ([System.DateTime]::Now)) -path $streamPath
+  [void] $stream.AppendLine("SRCSRV: ini ------------------------------------------------")
+  [void] $stream.AppendLine("VERSION=1")
+  [void] $stream.AppendLine("INDEXVERSION=2")
+  [void] $stream.AppendLine("VERCTL=Archive")
+  [void] $stream.AppendLine("DATETIME=" + ([System.DateTime]::Now))
 }
 
 ###############################################################
 
 function WriteStreamVariables {
-  param([string] $streamPath)
-  
+  param([System.Text.StringBuilder] $stream)
+
   Write-Verbose "Preparing stream variables section..."
 
-  Add-Content -value "SRCSRV: variables ------------------------------------------" -path $streamPath
-  Add-Content -value "SRCSRVVERCTRL=http" -path $streamPath
-  Add-Content -value "HTTP_ALIAS=$gitHubUrl" -path $streamPath
-  Add-Content -value "HTTP_EXTRACT_TARGET=%HTTP_ALIAS%/%var2%/%var3%/%var4%/%var5%" -path $streamPath
-  Add-Content -value "SRCSRVTRG=%http_extract_target%" -path $streamPath
-  Add-Content -value "SRCSRVCMD=" -path $streamPath
+  [void] $stream.AppendLine("SRCSRV: variables ------------------------------------------")
+  [void] $stream.AppendLine("SRCSRVVERCTRL=http")
+  [void] $stream.AppendLine("HTTP_ALIAS=$gitHubUrl")
+  [void] $stream.AppendLine("HTTP_EXTRACT_TARGET=%HTTP_ALIAS%/%var2%/%var3%/%var4%/%var5%")
+  [void] $stream.AppendLine("SRCSRVTRG=%http_extract_target%")
+  [void] $stream.AppendLine("SRCSRVCMD=")
 }
 
 ###############################################################
 
 function WriteStreamSources {
-  param([string] $streamPath,
+  param([System.Text.StringBuilder] $stream,
         [string] $pdbPath)
-        
+
   Write-Verbose "Preparing stream source files section..."
 
   $sources = & ($dbgToolsPath + 'srctool.exe') -r $pdbPath 2>$null
@@ -161,11 +196,11 @@ function WriteStreamSources {
 
   $numSources = $sources.Count
   Write-Verbose "Stream source contains $numSources files"
-  Add-Content -value "SRCSRV: source files ---------------------------------------" -path $streamPath
-    
+  [void] $stream.AppendLine("SRCSRV: source files ---------------------------------------")
+
   $sourcesRoot = CorrectPathBackslash $sourcesRoot
-  $outputFileName = [System.IO.Path]::GetFileNameWithoutExtension($sourceArchivePath)
-    
+  $indexed = 0
+
   #other source files
   foreach ($src in $sources) {
     
@@ -184,12 +219,6 @@ function WriteStreamSources {
       continue;
     }
 
-    if (-Not (Test-Path -path $src))  
-    {
-      Write-Verbose "Not found '$src'"
-      continue;
-    }
-    
     if (!$src.StartsWith($sourcesRoot, [System.StringComparison]::CurrentCultureIgnoreCase)) {
       if ($ignoreUnknown) {
         Write-Verbose "Ignore $src"
@@ -201,18 +230,12 @@ function WriteStreamSources {
 
     Write-Verbose "Attempting src = $src"
 
-    try
-    {
-      # Github url's are case sensitive, match file case identically
-      $wrongCasingPath = $src
-      $canonicalCasePath = Get-ChildItem -Path $wrongCasingPath.Replace("\","\*") | Where FullName -IEQ $wrongCasingPath | Select -ExpandProperty FullName
-      $src = $canonicalCasePath
-    }
-    catch
-    {
-      Write-Warning "Could not resolve file path for $src"
+    $canonicalCasePath = GetCanonicalPath $src
+    if ($canonicalCasePath -eq $null) {
+      Write-Verbose "Not found '$src'"
       continue
     }
+    $src = $canonicalCasePath
 
     $srcStrip = ""
 
@@ -248,10 +271,13 @@ function WriteStreamSources {
         break;
       }		
     }
-	
-    Add-Content -value $indexSourceTo -path $streamPath
+
+    [void] $stream.AppendLine($indexSourceTo)
+    $indexed++
     Write-Verbose "Indexing source to $urlVerbose"
   }
+
+  Write-Host "$([System.IO.Path]::GetFileName($pdbPath)): $indexed of $numSources source files indexed"
 }
 
 ###############################################################
@@ -271,24 +297,26 @@ foreach ($pdb in $pdbs) {
   $streamContent = [System.IO.Path]::GetTempFileName()
 
   try {
-    # fill the PDB stream file
-    WriteStreamHeader $streamContent
-    WriteStreamVariables $streamContent
-    $success = WriteStreamSources $streamContent $pdb.FullName
+    # build the PDB stream in memory, then write it once
+    $stream = New-Object System.Text.StringBuilder
+    WriteStreamHeader $stream
+    WriteStreamVariables $stream
+    $success = WriteStreamSources $stream $pdb.FullName
     if($success -eq "failed") {
         continue
     }
-    
-    Add-Content -value "SRCSRV: end ------------------------------------------------" -path $streamContent
-    
+
+    [void] $stream.AppendLine("SRCSRV: end ------------------------------------------------")
+    [System.IO.File]::WriteAllText($streamContent, $stream.ToString())
+
     # Save stream to the pdb file
     $pdbstrPath = "{0}pdbstr.exe" -f $dbgToolsPath
     $pdbFullName = $pdb.FullName
     # write stream info to the pdb file
-      
+
     Write-Verbose "Saving the generated stream into the PDB file..."
     . $pdbstrPath -w -s:srcsrv "-p:$pdbFullName" "-i:$streamContent"
-        
+
     Write-Verbose "Done."
   } finally {
     Remove-Item $streamContent
