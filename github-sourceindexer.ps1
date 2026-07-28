@@ -196,8 +196,16 @@ function WriteStreamSources {
 
   # srctool ends with a "<pdb>: N source files are indexed" summary. Left in place it gets treated
   # as another source path - harmless, since no such file exists, but it skews the counts.
+  # Select-Object rather than a 0..(n-2) slice: when the summary is the only line that range is
+  # 0..-1, which PowerShell reads as descending and would duplicate the line instead of emptying it.
   if ($sources[-1] -match ':\s+\d+\s+source files are indexed\s*$') {
-    $sources = $sources[0..($sources.Count - 2)]
+    $sources = @($sources | Select-Object -First ($sources.Count - 1))
+  }
+
+  if ($sources.Count -eq 0) {
+    write-warning "No steppable code in pdb file $pdbPath, skipping";
+    "failed";
+    return;
   }
 
   $numSources = $sources.Count

@@ -75,9 +75,11 @@ $repo_name = $repo_name -replace "$repo_userId/",""
 # Scratch has to live outside the tree. Callers that pass no -pdbPaths search the whole of
 # $localSourceDir for pdb's, and this repo is normally checked out inside it, so working folders
 # here would sit in the search root - and would survive in a checked out repo if a run died.
-$scratchRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
-$symbolsFolder = Join-Path $scratchRoot "symbols_tempJ1M39VNNDF"
-$outputFolder = Join-Path $scratchRoot "symstore_temp6JB24HH2Z"
+$scratchRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } elseif ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
+
+# Suffixed with the pid so two runs sharing a machine cannot Reset-Folder each other's work
+$symbolsFolder = Join-Path $scratchRoot "symbols_temp$PID"
+$outputFolder = Join-Path $scratchRoot "symstore_temp$PID"
 $dbgToolsPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x86"
 $symStorePath = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\symstore.exe"
 
@@ -499,7 +501,7 @@ $manifestFile = $null
 
 if ($uploadManifest.Count -gt 0)
 {
-       $manifestFile = Join-Path $env:TEMP "symsrv_manifest_$repo_branch.txt"
+       $manifestFile = Join-Path $scratchRoot "symsrv_manifest_${repo_branch}_$PID.txt"
        Set-Content -LiteralPath $manifestFile -Value $uploadManifest -Encoding ASCII
 }
 
