@@ -1,0 +1,91 @@
+name: Check scripts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Parse and analyze
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      # main.bat runs powershell.exe, so 5.1 is the runtime that has to accept these files.
+      # pwsh 7 parsing clean is not the same guarantee.
+      - name: Parse under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $failed = $false
+
+          foreach ($script in (Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter *.ps1 -Recurse -File)) {
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref] $null, [ref] $errors)
+
+            if ($errors -and $errors.Count) {
+              $failed = $true
+              Write-Host "::group::FAIL $($script.Name)"
+              foreach ($e in $errors) {
+                Write-Host "::error file=$($script.Name),line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              }
+              Write-Host "::endgroup::"
+            } else {
+              Write-Host "OK   $($script.Name)"
+            }
+          }
+
+          Write-Host "PSVersion: $($PSVersionTable.PSVersion)"
+          if ($failed) { exit 1 }
+
+      # main.ps1 calls these by relative path, so a rename here breaks every consumer repo
+      # at release time rather than at review time
+      - name: Check partner scripts resolve
+        shell: powershell
+        run: |
+          $missing = @()
+
+          foreach ($required in @('main.ps1', 'github-sourceindexer.ps1', 's3upload.ps1', 'main.bat')) {
+            if (-Not (Test-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $required))) { $missing += $required }
+          }
+
+          if ($missing.Count) {
+            Write-Host "::error::main.ps1 expects these alongside it: $($missing -join ', ')"
+            exit 1
+          }
+
+          Write-Host "All partner scripts present"
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          # An install or import that fails quietly would leave this step reporting a clean run
+          # against zero files, which is worse than no check at all
+          $ErrorActionPreference = 'Stop'
+
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber -ErrorAction Stop
+          Import-Module PSScriptAnalyzer -ErrorAction Stop
+
+          if (-Not (Get-Command Invoke-ScriptAnalyzer -ErrorAction SilentlyContinue)) {
+            Write-Host "::error::PSScriptAnalyzer installed but Invoke-ScriptAnalyzer is unavailable"
+            exit 1
+          }
+
+          # Write-Host is how these scripts talk to the CI log, the parameters flagged as unused
+          # are read at script scope from inside functions, and trailing whitespace is noise.
+          $excluded = @('PSAvoidUsingWriteHost', 'PSReviewUnusedParameter', 'PSAvoidTrailingWhitespace')
+          $results = @(Invoke-ScriptAnalyzer -Path $env:GITHUB_WORKSPACE -Recurse -ExcludeRule $excluded)
+
+          foreach ($r in $results) {
+            $level = if ($r.Severity -eq 'Error') { 'error' } else { 'warning' }
+            Write-Host "::${level} file=$($r.ScriptName),line=$($r.Line)::$($r.RuleName): $($r.Message)"
+          }
+
+          $errors = @($results | Where-Object Severity -eq 'Error')
+          Write-Host "$($results.Count) finding(s), $($errors.Count) of them errors"
+
+          # Warnings are advisory here; only genuine breakage fails the build
+          if ($errors.Count) { exit 1 }
