@@ -64,7 +64,7 @@ $dbgToolsPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x86"
 # Debuggers tools from winsdk are required
 if (-Not (Test-Path -path $dbgToolsPath))
 {
-       Write-Out "Installing debuggers tools from winsdk..."
+       Write-Output "Installing debuggers tools from winsdk..."
        Invoke-WebRequest https://go.microsoft.com/fwlink/?linkid=2173743 -OutFile winsdksetup.exe;    
        start-Process winsdksetup.exe -ArgumentList '/features OptionId.WindowsDesktopDebuggers /q' -Wait;    
        Remove-Item -Force winsdksetup.exe;
