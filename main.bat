@@ -1,5 +1,8 @@
 @echo on
-cd %1
+:: /d is required - without it cd sets the target drive's directory but stays on the
+:: current drive, and the relative script paths below then resolve somewhere else.
+:: %~1 strips any quotes the caller added, so re-quoting here survives spaces either way.
+cd /d "%~1"
 powershell.exe -ExecutionPolicy Bypass -Command %2
 
 :: Exit with non-zero so GitHub action knows there was an issue
