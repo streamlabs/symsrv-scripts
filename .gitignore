@@ -1,0 +1,4 @@
+# Working folders now live under RUNNER_TEMP/TEMP, but older revisions of main.ps1 created them
+# here. Keeps an interrupted run from leaving gigabytes of pdb's stageable.
+symbols_temp*/
+symstore_temp*/

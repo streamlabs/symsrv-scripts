@@ -93,10 +93,10 @@ function CheckDebuggingToolsPath {
   } else {
     Write-Verbose "Debugging Tools path not provided - trying to guess it..."
     # Let's try to execute the srctool and check the error
-    if ($(Get-Command "srctool.exe" 2>$null) -eq $null) {
+    if ($null -eq $(Get-Command "srctool.exe" 2>$null)) {
       # srctool.exe can't be found - let's try cdb
       $cdbg = Get-Command "cdb.exe" 2>$null
-      if ($cdbg -eq $null) {
+      if ($null -eq $cdbg) {
         $errormsg = "The Debugging Tools for Windows could not be found. Please make sure " + `
                     "that they are installed and reference them using -dbgToolsPath switch."
         throw $errormsg        
@@ -187,11 +187,17 @@ function WriteStreamSources {
 
   Write-Verbose "Preparing stream source files section..."
 
-  $sources = & ($dbgToolsPath + 'srctool.exe') -r $pdbPath 2>$null
-  if ($sources -eq $null) {
+  $sources = @(& ($dbgToolsPath + 'srctool.exe') -r $pdbPath 2>$null)
+  if ($null -eq $sources -or $sources.Count -eq 0) {
     write-warning "No steppable code in pdb file $pdbPath, skipping";
     "failed";
     return;
+  }
+
+  # srctool ends with a "<pdb>: N source files are indexed" summary. Left in place it gets treated
+  # as another source path - harmless, since no such file exists, but it skews the counts.
+  if ($sources[-1] -match ':\s+\d+\s+source files are indexed\s*$') {
+    $sources = $sources[0..($sources.Count - 2)]
   }
 
   $numSources = $sources.Count
@@ -231,7 +237,7 @@ function WriteStreamSources {
     Write-Verbose "Attempting src = $src"
 
     $canonicalCasePath = GetCanonicalPath $src
-    if ($canonicalCasePath -eq $null) {
+    if ($null -eq $canonicalCasePath) {
       Write-Verbose "Not found '$src'"
       continue
     }

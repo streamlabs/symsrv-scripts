@@ -40,7 +40,7 @@ param(
 
 $subModules_ArrayArray = @(@())
 
-if ($subModules -ne $null)
+if ($null -ne $subModules)
 {
        $subModules = $subModules.split(";")
 
@@ -51,17 +51,17 @@ if ($subModules -ne $null)
        }
 }
 
-if ($ignoreArray -ne $null)
+if ($null -ne $ignoreArray)
 {
        $ignoreArray = $ignoreArray.split(",")
 }
 
-if ($pdbPaths -ne $null)
+if ($null -ne $pdbPaths)
 {
        $pdbPaths = $pdbPaths.split(",")
 }
 
-if ($excludePdbNames -ne $null)
+if ($null -ne $excludePdbNames)
 {
        $excludePdbNames = $excludePdbNames.split(",")
 }
@@ -71,8 +71,13 @@ if ($excludePdbNames -ne $null)
 $excludePdbNames = @('vc1??.pdb') + @($excludePdbNames | Where-Object { $_ })
 
 $repo_name = $repo_name -replace "$repo_userId/",""
-$symbolsFolder = "symbols_tempJ1M39VNNDF"
-$outputFolder = "symstore_temp6JB24HH2Z"
+
+# Scratch has to live outside the tree. Callers that pass no -pdbPaths search the whole of
+# $localSourceDir for pdb's, and this repo is normally checked out inside it, so working folders
+# here would sit in the search root - and would survive in a checked out repo if a run died.
+$scratchRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+$symbolsFolder = Join-Path $scratchRoot "symbols_tempJ1M39VNNDF"
+$outputFolder = Join-Path $scratchRoot "symstore_temp6JB24HH2Z"
 $dbgToolsPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x86"
 $symStorePath = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\symstore.exe"
 
@@ -330,25 +335,54 @@ function Get-PresentSymbolKeys
 if (-Not (Test-Path -path $dbgToolsPath))
 {
        Write-Output "Installing debuggers tools from winsdk..."
-       Invoke-WebRequest https://go.microsoft.com/fwlink/?linkid=2173743 -OutFile winsdksetup.exe;    
-       start-Process winsdksetup.exe -ArgumentList '/features OptionId.WindowsDesktopDebuggers /q' -Wait;    
+       Invoke-WebRequest https://go.microsoft.com/fwlink/?linkid=2173743 -OutFile winsdksetup.exe;
+       start-Process winsdksetup.exe -ArgumentList '/features OptionId.WindowsDesktopDebuggers /q' -Wait;
        Remove-Item -Force winsdksetup.exe;
 }
 
-# Submodules need the version used at compilation time deduced
+# symstore ships in the x64 folder, so the x86 check above does not cover it
+if (-Not (Test-Path -LiteralPath $symStorePath))
+{
+       Write-Error "symstore.exe not found at $symStorePath. Install the winsdk Windows Desktop Debuggers."
+       exit 1
+}
+
+# Submodules need the version used at compilation time deduced. Anonymous api.github.com calls are
+# limited per IP and shared across runners, so send a token when one is available and treat a
+# failure as non fatal - the branch name still resolves, it just is not pinned to a commit.
+$githubApiHeaders = @{ 'User-Agent' = 'symsrv-scripts' }
+$githubToken = if ($env:GH_TOKEN) { $env:GH_TOKEN } else { $env:GITHUB_TOKEN }
+
+if ($githubToken)
+{
+       $githubApiHeaders['Authorization'] = "Bearer $githubToken"
+}
+else
+{
+       Write-SymsrvDebug "No GH_TOKEN or GITHUB_TOKEN set, querying api.github.com anonymously"
+}
+
 for ($i = 0 ; $i -lt $subModules_ArrayArray.Count ; $i++)
 {
        $subModule_UserName = $subModules_ArrayArray[$i][1]
        $subModule_RepoName = $subModules_ArrayArray[$i][2]
        $subModule_Branch = $subModules_ArrayArray[$i][3]
-       $mainRepoContentJson = (Invoke-WebRequest "https://api.github.com/repos/$subModule_UserName/$subModule_RepoName/commits/$subModule_Branch"        -UseBasicParsing | ConvertFrom-Json)
-       $subModules_ArrayArray[$i][3] = $mainRepoContentJson.sha
+
+       try
+       {
+              $mainRepoContentJson = (Invoke-WebRequest "https://api.github.com/repos/$subModule_UserName/$subModule_RepoName/commits/$subModule_Branch" -Headers $githubApiHeaders -UseBasicParsing | ConvertFrom-Json)
+              $subModules_ArrayArray[$i][3] = $mainRepoContentJson.sha
+       }
+       catch
+       {
+              Write-Warning "Could not resolve $subModule_UserName/$subModule_RepoName@$subModule_Branch to a commit ($($_.Exception.Message)). Source links for it will follow the branch instead."
+       }
 }
 
 # Copy symbols from the source directory
 Reset-Folder $symbolsFolder
 
-if ($pdbPaths -eq $null)
+if ($null -eq $pdbPaths)
 {
        $collected = Copy-PdbFiles -sourcePaths @($localSourceDir) -destination $symbolsFolder -excludeNames $excludePdbNames
 }
