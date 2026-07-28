@@ -62,13 +62,22 @@ jobs:
       - name: PSScriptAnalyzer
         shell: pwsh
         run: |
-          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber
-          Import-Module PSScriptAnalyzer
+          # An install or import that fails quietly would leave this step reporting a clean run
+          # against zero files, which is worse than no check at all
+          $ErrorActionPreference = 'Stop'
+
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber -ErrorAction Stop
+          Import-Module PSScriptAnalyzer -ErrorAction Stop
+
+          if (-Not (Get-Command Invoke-ScriptAnalyzer -ErrorAction SilentlyContinue)) {
+            Write-Host "::error::PSScriptAnalyzer installed but Invoke-ScriptAnalyzer is unavailable"
+            exit 1
+          }
 
           # Write-Host is how these scripts talk to the CI log, the parameters flagged as unused
           # are read at script scope from inside functions, and trailing whitespace is noise.
           $excluded = @('PSAvoidUsingWriteHost', 'PSReviewUnusedParameter', 'PSAvoidTrailingWhitespace')
-          $results = Invoke-ScriptAnalyzer -Path $env:GITHUB_WORKSPACE -Recurse -ExcludeRule $excluded
+          $results = @(Invoke-ScriptAnalyzer -Path $env:GITHUB_WORKSPACE -Recurse -ExcludeRule $excluded)
 
           foreach ($r in $results) {
             $level = if ($r.Severity -eq 'Error') { 'error' } else { 'warning' }
