@@ -329,9 +329,9 @@ function Get-PresentSymbolKeys
 # Debuggers tools from winsdk are required
 if (-Not (Test-Path -path $dbgToolsPath))
 {
-       Write-Host "Installing debuggers tools from winsdk..."
-       Invoke-WebRequest https://go.microsoft.com/fwlink/?linkid=2173743 -OutFile winsdksetup.exe;
-       start-Process winsdksetup.exe -ArgumentList '/features OptionId.WindowsDesktopDebuggers /q' -Wait;
+       Write-Output "Installing debuggers tools from winsdk..."
+       Invoke-WebRequest https://go.microsoft.com/fwlink/?linkid=2173743 -OutFile winsdksetup.exe;    
+       start-Process winsdksetup.exe -ArgumentList '/features OptionId.WindowsDesktopDebuggers /q' -Wait;    
        Remove-Item -Force winsdksetup.exe;
 }
 
