@@ -7,6 +7,7 @@ Entry point is **main.ps1**
 * Works out each pdb's store key with **symstore.exe /x** and drops the ones the bucket already has
 * Edits the remaining pdb's to use http paths using a modified [github-sourceindexer.ps1](https://github.com/Haemoglobin/GitHub-Source-Indexer) script
 * Runs microsoft's **symstore.exe** on the .pdb files
+* Checks every compressed file is a single, self-contained cabinet before anything leaves the machine
 * Uploads output to the s3 bucket using AWS_SYMB_ACCESS_KEY_ID and AWS_SYMB_SECRET_ACCESS_KEY system env vars
 
 **The working directory needs to able to find partner scripts at .\here**
@@ -24,6 +25,21 @@ Pdb's with an all-F signature are dropped. symstore writes that when it cannot r
 of the file, which is the case for static library compile pdb's - no binary's debug directory points
 at one, so nothing can ever look the key up. `vc140.pdb` through `vc143.pdb` are dropped by name for
 the same reason. Add more with **-excludePdbNames** (accepts wildcards, e.g. `'moc.pdb,Qt6Example*.pdb'`).
+
+## Very large pdb's
+
+`symstore /compress` spans its cabinet output once a pdb gets big enough, and hands every cabinet in
+the set the same filename - so only the last one survives on disk. What reaches the bucket is then a
+cabinet that downloads fine and fails to expand on every client, which surfaces much later as a
+debugger that keeps asking for a pdb it has already downloaded.
+
+Pdb's over 1 GB are held back from that pass. They are stored uncompressed so symstore still works
+out the key and builds the folder, then compressed in place with **makecab** and `MaxDiskSize=0`,
+which is what keeps the result in a single cabinet. The store key is the same either way, so nothing
+downstream needs to know which path a pdb took.
+
+Every `.pd_` is then checked - cabinet magic, the size the header declares against the real size,
+and the spanned set flags - and the run fails instead of uploading one no client could use.
 
 ## Debug output
 

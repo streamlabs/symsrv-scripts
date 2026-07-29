@@ -79,6 +79,7 @@ $scratchRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } elseif ($env:TEMP) { $
 
 # Suffixed with the pid so two runs sharing a machine cannot Reset-Folder each other's work
 $symbolsFolder = Join-Path $scratchRoot "symbols_temp$PID"
+$largeFolder = Join-Path $scratchRoot "symbols_large$PID"
 $outputFolder = Join-Path $scratchRoot "symstore_temp$PID"
 $dbgToolsPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x86"
 $symStorePath = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\symstore.exe"
@@ -89,6 +90,11 @@ $storePrefix = "symbols"
 
 $debugEnv = "$env:SYMSRV_DEBUG".Trim()
 $isDebug = $debugOutput.IsPresent -or ($debugEnv -and @('0','false','no','off') -notcontains $debugEnv.ToLower())
+
+# symstore /compress spans its cabinet output once a pdb gets big enough, and hands every cabinet
+# in the set the same filename - so only the last one survives on disk, and no client can expand
+# it. Pdb's over this go through makecab below instead, which is told to stay in one cabinet.
+$largePdbThreshold = 1GB
 
 ##
 # Helpers
@@ -172,6 +178,95 @@ function Copy-PdbFiles
        Write-Host "Collected $copied pdb's ($excluded excluded by name, $collisions name collisions)"
 
        return $copied
+}
+
+# A cabinet that is one part of a spanned set downloads fine and then fails to expand on every
+# client, so the only place it can be caught is here. Returns why it is unusable, or $null.
+function Test-SingleCabinet
+{
+       param([string] $path)
+
+       $header = New-Object byte[] 36
+       $stream = [System.IO.File]::OpenRead($path)
+
+       try
+       {
+              $read = $stream.Read($header, 0, $header.Length)
+       }
+       finally
+       {
+              $stream.Dispose()
+       }
+
+       if ($read -ne $header.Length)
+       {
+              return "shorter than a cabinet header"
+       }
+
+       if ([System.Text.Encoding]::ASCII.GetString($header, 0, 4) -ne 'MSCF')
+       {
+              return "not a cabinet"
+       }
+
+       $declared = [System.BitConverter]::ToUInt32($header, 8)
+       $flags = [System.BitConverter]::ToUInt16($header, 30)
+       $index = [System.BitConverter]::ToUInt16($header, 34)
+       $actual = (Get-Item -LiteralPath $path).Length
+
+       if ($declared -ne $actual)
+       {
+              return "header declares $declared bytes, file is $actual"
+       }
+
+       # cfhdrPREV_CABINET | cfhdrNEXT_CABINET
+       if (($flags -band 0x3) -ne 0 -or $index -ne 0)
+       {
+              return ("cabinet {0} of a spanned set (flags 0x{1:X4})" -f $index, $flags)
+       }
+
+       return $null
+}
+
+# Replaces a pdb symstore stored uncompressed with the .pd_ a client will ask for. MaxDiskSize=0
+# is the part that matters - it is what keeps the output in a single cabinet. LZX 21 matches what
+# symstore /compress produces for everything else. Returns why it failed, or $null.
+function Compress-StorePdb
+{
+       param([string] $storedPdb)
+
+       $cab = $storedPdb.Substring(0, $storedPdb.Length - 1) + '_'
+       $scratch = Join-Path $scratchRoot "makecab_temp$PID"
+
+       Reset-Folder $scratch
+
+       try
+       {
+              $log = & makecab.exe /D MaxDiskSize=0 /D CompressionType=LZX /D CompressionMemory=21 `
+                     /D "InfFileName=$(Join-Path $scratch 'setup.inf')" `
+                     /D "RptFileName=$(Join-Path $scratch 'setup.rpt')" `
+                     $storedPdb $cab 2>&1
+              $code = $LASTEXITCODE
+       }
+       finally
+       {
+              Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+       }
+
+       # makecab reports a percentage per block and no verbosity flag turns it off, which is tens
+       # of thousands of lines on a pdb big enough to get here
+       $log = @($log | Where-Object { $_ -notmatch '^\s*\d+\.\d+%' })
+
+       Write-SymsrvDebug ($log -join [Environment]::NewLine)
+
+       if ($code -ne 0 -or -Not (Test-Path -LiteralPath $cab))
+       {
+              Write-Host ($log -join [Environment]::NewLine)
+              return "makecab returned $code"
+       }
+
+       Remove-Item -LiteralPath $storedPdb -Force
+
+       return $null
 }
 
 # symstore's /x index mode writes out the store key for every pdb without copying or compressing
@@ -480,20 +575,97 @@ if ($isDebug)
 
 .\github-sourceindexer.ps1 @indexerArgs
 
-# Run symstore on all of the .pdb's
+# Hold the oversized pdb's back from the /compress pass; they get compressed further down
 Reset-Folder $outputFolder
-& $symStorePath add /compress /r /f $symbolsFolder /s $outputFolder /t SLOBS
+Reset-Folder $largeFolder
 
-if ($LASTEXITCODE -ne 0)
+foreach ($pdb in @(Get-ChildItem -LiteralPath $symbolsFolder -Filter *.pdb -File))
 {
-       Write-Warning "symstore returned $LASTEXITCODE"
+       if ($pdb.Length -gt $largePdbThreshold)
+       {
+              Write-Host ("Too large for symstore compression, handling separately: $($pdb.Name) ({0:N0} bytes)" -f $pdb.Length)
+              Move-Item -LiteralPath $pdb.FullName -Destination (Join-Path $largeFolder $pdb.Name) -Force
+       }
 }
 
-if (@(Get-ChildItem -LiteralPath $outputFolder -Filter *.pd_ -Recurse -File -ErrorAction SilentlyContinue).Count -eq 0)
+# Run symstore on all of the .pdb's
+if (@(Get-ChildItem -LiteralPath $symbolsFolder -Filter *.pdb -File).Count -gt 0)
+{
+       & $symStorePath add /compress /r /f $symbolsFolder /s $outputFolder /t SLOBS
+
+       if ($LASTEXITCODE -ne 0)
+       {
+              Write-Warning "symstore returned $LASTEXITCODE"
+       }
+}
+
+# The oversized ones go in uncompressed so symstore works out the key and builds the folder, then
+# each is compressed in place. A pdb left behind here would never be asked for by that name once
+# a .pd_ is expected, so a makecab failure has to stop the run rather than upload half a store.
+$largePdbs = @(Get-ChildItem -LiteralPath $largeFolder -Filter *.pdb -File)
+
+if ($largePdbs.Count -gt 0)
+{
+       & $symStorePath add /r /f $largeFolder /s $outputFolder /t SLOBS
+
+       if ($LASTEXITCODE -ne 0)
+       {
+              Write-Warning "symstore returned $LASTEXITCODE"
+       }
+
+       foreach ($large in $largePdbs)
+       {
+              # Nothing downstream looks at these by name, so an empty result here would drop the
+              # symbol from the upload without anything else noticing
+              $stored = @(Get-ChildItem -LiteralPath $outputFolder -Filter $large.Name -Recurse -File)
+
+              if ($stored.Count -eq 0)
+              {
+                     Write-Error "symstore did not store $($large.Name)"
+                     exit 1
+              }
+
+              foreach ($file in $stored)
+              {
+                     Write-Host "Compressing $($file.Name) with makecab"
+                     $failure = Compress-StorePdb -storedPdb $file.FullName
+
+                     if ($failure)
+                     {
+                            Write-Error "Could not compress $($file.FullName): $failure"
+                            exit 1
+                     }
+              }
+       }
+}
+
+$cabs = @(Get-ChildItem -LiteralPath $outputFolder -Filter *.pd_ -Recurse -File -ErrorAction SilentlyContinue)
+
+if ($cabs.Count -eq 0)
 {
        Write-Error "symstore produced no compressed symbols from $($remaining.Count) pdb's"
        exit 1
 }
+
+$badCabs = @()
+
+foreach ($cab in $cabs)
+{
+       $failure = Test-SingleCabinet -path $cab.FullName
+
+       if ($failure)
+       {
+              $badCabs += "$($cab.FullName): $failure"
+       }
+}
+
+if ($badCabs.Count -gt 0)
+{
+       Write-Error ("Unusable compressed symbols, refusing to upload:" + [Environment]::NewLine + ($badCabs -join [Environment]::NewLine))
+       exit 1
+}
+
+Write-Host "$($cabs.Count) compressed symbol file(s) verified as single cabinets"
 
 # Record what this build added, since the store's own 000Admin transaction log is not usable
 # against a bucket that many builds write to concurrently
@@ -513,6 +685,7 @@ try
        # Cleanup
        Remove-Item -LiteralPath $outputFolder -Recurse -Force -ErrorAction SilentlyContinue
        Remove-Item -LiteralPath $symbolsFolder -Recurse -Force -ErrorAction SilentlyContinue
+       Remove-Item -LiteralPath $largeFolder -Recurse -Force -ErrorAction SilentlyContinue
 }
 catch
 {
@@ -520,6 +693,7 @@ catch
 
        Remove-Item -LiteralPath $outputFolder -Recurse -Force -ErrorAction SilentlyContinue
        Remove-Item -LiteralPath $symbolsFolder -Recurse -Force -ErrorAction SilentlyContinue
+       Remove-Item -LiteralPath $largeFolder -Recurse -Force -ErrorAction SilentlyContinue
 
        # Run the failure upward to the calling script if there is one
        exit 1
