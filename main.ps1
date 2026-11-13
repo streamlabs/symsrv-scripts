@@ -27,7 +27,13 @@ param(
        # Pdb file names to keep out of the store, format input like this "name.pdb,prefix*.pdb"
        [string[]] $excludePdbNames,
 
-       # Index and upload every pdb, even the ones the symbol store already has
+       # Paths to find .exe, .dll and .node files in, if empty then no binaries are uploaded
+       [string[]] $binPaths,
+
+       # Binary file names to keep out of the store, format input like this "name.dll,prefix*.dll"
+       [string[]] $excludeBinNames,
+
+       # Index and upload every pdb and binary, even the ones the symbol store already has
        [switch] $forceUpload,
 
        # Verbose script output and aws --debug. Also enabled by setting SYMSRV_DEBUG=1
@@ -70,6 +76,18 @@ if ($null -ne $excludePdbNames)
 # points at one, so a debugger can never request them - the linker pdb carries that code's symbols.
 $excludePdbNames = @('vc1??.pdb') + @($excludePdbNames | Where-Object { $_ })
 
+if ($null -ne $binPaths)
+{
+       $binPaths = $binPaths.split(",")
+}
+
+if ($null -ne $excludeBinNames)
+{
+       $excludeBinNames = $excludeBinNames.split(",")
+}
+
+$excludeBinNames = @('*unit_tests*', 'vc_redist*', '*.tmp') + @($excludeBinNames | Where-Object { $_ })
+
 $repo_name = $repo_name -replace "$repo_userId/",""
 
 # Scratch has to live outside the tree. Callers that pass no -pdbPaths search the whole of
@@ -79,6 +97,7 @@ $scratchRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } elseif ($env:TEMP) { $
 
 # Suffixed with the pid so two runs sharing a machine cannot Reset-Folder each other's work
 $symbolsFolder = Join-Path $scratchRoot "symbols_temp$PID"
+$binFolder = Join-Path $scratchRoot "symbols_bin$PID"
 $largeFolder = Join-Path $scratchRoot "symbols_large$PID"
 $outputFolder = Join-Path $scratchRoot "symstore_temp$PID"
 $dbgToolsPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x86"
@@ -93,8 +112,8 @@ $isDebug = $debugOutput.IsPresent -or ($debugEnv -and @('0','false','no','off') 
 
 # symstore /compress spans its cabinet output once a pdb gets big enough, and hands every cabinet
 # in the set the same filename - so only the last one survives on disk, and no client can expand
-# it. Pdb's over this go through makecab below instead, which is told to stay in one cabinet.
-$largePdbThreshold = 1GB
+# it. Files over this go through makecab below instead, which is told to stay in one cabinet.
+$largeFileThreshold = 1GB
 
 ##
 # Helpers
@@ -121,14 +140,17 @@ function Reset-Folder
        New-Item -ItemType Directory -Path $path -Force | Out-Null
 }
 
-# Flattens every pdb under $sourcePaths into $destination. Names have to be unique in the store
-# folder, so a second pdb with the same name wins - which is fine as long as it is not silent.
-function Copy-PdbFiles
+# Flattens every file matching $filters under $sourcePaths into $destination. Names have to be
+# unique in the store folder, so a second file with the same name wins - which is fine as long as
+# it is not silent.
+function Copy-SymbolFiles
 {
        param(
               [string[]] $sourcePaths,
               [string] $destination,
-              [string[]] $excludeNames
+              [string[]] $excludeNames,
+              [string[]] $filters,
+              [string] $kind
        )
 
        $seen = @{}
@@ -140,16 +162,22 @@ function Copy-PdbFiles
        {
               if (-Not (Test-Path -LiteralPath $sourcePath))
               {
-                     Write-Warning "Pdb search path does not exist, skipping: $sourcePath"
+                     Write-Warning "Search path for $kind does not exist, skipping: $sourcePath"
                      continue
               }
 
-              foreach ($pdb in (Get-ChildItem -LiteralPath $sourcePath -Filter *.pdb -Recurse -File -ErrorAction SilentlyContinue))
+              $found = foreach ($filter in $filters)
+              {
+                     # -Filter also matches longer extensions that share the first three characters
+                     Get-ChildItem -LiteralPath $sourcePath -Filter $filter -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like $filter }
+              }
+
+              foreach ($file in $found)
               {
                      $skip = $false
                      foreach ($pattern in $excludeNames)
                      {
-                            if ($pdb.Name -like $pattern)
+                            if ($file.Name -like $pattern)
                             {
                                    $skip = $true
                                    break
@@ -159,23 +187,23 @@ function Copy-PdbFiles
                      if ($skip)
                      {
                             $excluded++
-                            Write-SymsrvDebug "Excluded by name: $($pdb.FullName)"
+                            Write-SymsrvDebug "Excluded by name: $($file.FullName)"
                             continue
                      }
 
-                     if ($seen.ContainsKey($pdb.Name))
+                     if ($seen.ContainsKey($file.Name))
                      {
                             $collisions++
-                            Write-Warning "pdb name collision: '$($pdb.FullName)' overwrites '$($seen[$pdb.Name])'"
+                            Write-Warning "$kind name collision: '$($file.FullName)' overwrites '$($seen[$file.Name])'"
                      }
 
-                     Copy-Item -LiteralPath $pdb.FullName -Destination (Join-Path $destination $pdb.Name) -Force
-                     $seen[$pdb.Name] = $pdb.FullName
+                     Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $destination $file.Name) -Force
+                     $seen[$file.Name] = $file.FullName
                      $copied++
               }
        }
 
-       Write-Host "Collected $copied pdb's ($excluded excluded by name, $collisions name collisions)"
+       Write-Host "Collected $copied $kind ($excluded excluded by name, $collisions name collisions)"
 
        return $copied
 }
@@ -227,14 +255,15 @@ function Test-SingleCabinet
        return $null
 }
 
-# Replaces a pdb symstore stored uncompressed with the .pd_ a client will ask for. MaxDiskSize=0
+# Replaces a file symstore stored uncompressed with the compressed name (.pd_, .dl_, ...) a client
+# will ask for. MaxDiskSize=0
 # is the part that matters - it is what keeps the output in a single cabinet. LZX 21 matches what
 # symstore /compress produces for everything else. Returns why it failed, or $null.
-function Compress-StorePdb
+function Compress-StoreFile
 {
-       param([string] $storedPdb)
+       param([string] $storedFile)
 
-       $cab = $storedPdb.Substring(0, $storedPdb.Length - 1) + '_'
+       $cab = $storedFile.Substring(0, $storedFile.Length - 1) + '_'
        $scratch = Join-Path $scratchRoot "makecab_temp$PID"
 
        Reset-Folder $scratch
@@ -244,7 +273,7 @@ function Compress-StorePdb
               $log = & makecab.exe /D MaxDiskSize=0 /D CompressionType=LZX /D CompressionMemory=21 `
                      /D "InfFileName=$(Join-Path $scratch 'setup.inf')" `
                      /D "RptFileName=$(Join-Path $scratch 'setup.rpt')" `
-                     $storedPdb $cab 2>&1
+                     $storedFile $cab 2>&1
               $code = $LASTEXITCODE
        }
        finally
@@ -253,7 +282,7 @@ function Compress-StorePdb
        }
 
        # makecab reports a percentage per block and no verbosity flag turns it off, which is tens
-       # of thousands of lines on a pdb big enough to get here
+       # of thousands of lines on a file big enough to get here
        $log = @($log | Where-Object { $_ -notmatch '^\s*\d+\.\d+%' })
 
        Write-SymsrvDebug ($log -join [Environment]::NewLine)
@@ -264,14 +293,15 @@ function Compress-StorePdb
               return "makecab returned $code"
        }
 
-       Remove-Item -LiteralPath $storedPdb -Force
+       Remove-Item -LiteralPath $storedFile -Force
 
        return $null
 }
 
-# symstore's /x index mode writes out the store key for every pdb without copying or compressing
+# symstore's /x index mode writes out the store key for every file without copying or compressing
 # anything, so it costs a fraction of a second. /t is rejected in combination with /x.
 # Index lines look like: "name.pdb","name.pdb\<GUID><AGE>","name.pdb",typ,,,,
+# or, for a binary: "name.dll","name.dll\<TIMESTAMP><SIZEOFIMAGE>","name.dll",bin,,,,
 function Get-SymbolStoreEntries
 {
        param(
@@ -289,7 +319,7 @@ function Get-SymbolStoreEntries
 
               if (-Not (Test-Path -LiteralPath $indexFile))
               {
-                     Write-Warning "symstore did not produce an index file; every pdb will be uploaded."
+                     Write-Warning "symstore did not produce an index file; every file will be uploaded."
                      return $entries
               }
 
@@ -314,7 +344,7 @@ function Get-SymbolStoreEntries
        }
        catch
        {
-              Write-Warning "Could not index pdb's for a store lookup ($($_.Exception.Message)); every pdb will be uploaded."
+              Write-Warning "Could not index files for a store lookup ($($_.Exception.Message)); every file will be uploaded."
               return @()
        }
        finally
@@ -359,7 +389,7 @@ function Get-PresentSymbolKeys
        }
        catch
        {
-              Write-Warning "Symbol store lookup unavailable ($($_.Exception.Message)); every pdb will be uploaded."
+              Write-Warning "Symbol store lookup unavailable ($($_.Exception.Message)); every file will be uploaded."
               return $present
        }
 
@@ -414,7 +444,7 @@ function Get-PresentSymbolKeys
        }
        catch
        {
-              Write-Warning "Symbol store lookup failed ($($_.Exception.Message)); remaining pdb's will be uploaded."
+              Write-Warning "Symbol store lookup failed ($($_.Exception.Message)); remaining files will be uploaded."
        }
        finally
        {
@@ -476,32 +506,17 @@ for ($i = 0 ; $i -lt $subModules_ArrayArray.Count ; $i++)
        }
 }
 
-# Copy symbols from the source directory
-Reset-Folder $symbolsFolder
-
-if ($null -eq $pdbPaths)
+# Drops everything the store already has from $folder before doing any expensive work on it, and
+# returns the keys of what is left. Indexing writes an srcsrv stream into a named pdb stream and
+# leaves the signature alone, so the key computed here is the same key symstore will produce
+# after indexing.
+function Remove-StoredSymbols
 {
-       $collected = Copy-PdbFiles -sourcePaths @($localSourceDir) -destination $symbolsFolder -excludeNames $excludePdbNames
-}
-else
-{
-       $collected = Copy-PdbFiles -sourcePaths $pdbPaths -destination $symbolsFolder -excludeNames $excludePdbNames
-}
+       param([string] $folder)
 
-$collectedAny = ($collected -gt 0)
+       $manifestKeys = @()
 
-# Drop everything the store already has before doing any expensive work on it. Indexing writes an
-# srcsrv stream into a named pdb stream and leaves the signature alone, so the key computed here
-# is the same key symstore will produce after indexing.
-$uploadManifest = @()
-
-if ($forceUpload)
-{
-       Write-Host "-forceUpload set, skipping the symbol store lookup"
-}
-else
-{
-       $entries = Get-SymbolStoreEntries -symbolsFolder $symbolsFolder -symStorePath $symStorePath
+       $entries = Get-SymbolStoreEntries -symbolsFolder $folder -symStorePath $symStorePath
 
        if ($entries.Count -gt 0)
        {
@@ -513,7 +528,7 @@ else
               foreach ($entry in $unusable)
               {
                      Write-SymsrvDebug "Unusable signature, dropping: $($entry.FileName)"
-                     Remove-Item -LiteralPath (Join-Path $symbolsFolder $entry.FileName) -Force -ErrorAction SilentlyContinue
+                     Remove-Item -LiteralPath (Join-Path $folder $entry.FileName) -Force -ErrorAction SilentlyContinue
               }
 
               $keys = @($usable | ForEach-Object { "$storePrefix/$($_.FileName)/$($_.Guid)/$($_.CompressedName)" })
@@ -526,67 +541,111 @@ else
                      if ($present.ContainsKey($key))
                      {
                             Write-SymsrvDebug "Already in the store, dropping: $key"
-                            Remove-Item -LiteralPath (Join-Path $symbolsFolder $entry.FileName) -Force -ErrorAction SilentlyContinue
+                            Remove-Item -LiteralPath (Join-Path $folder $entry.FileName) -Force -ErrorAction SilentlyContinue
                      }
                      else
                      {
-                            $uploadManifest += $key
+                            $manifestKeys += $key
                      }
               }
 
-              Write-Host "Symbol store: $($entries.Count) indexed, $($unusable.Count) without a usable signature, $($present.Count) already stored, $($uploadManifest.Count) to upload"
+              Write-Host "Symbol store: $($entries.Count) indexed, $($unusable.Count) without a usable signature, $($present.Count) already stored, $($manifestKeys.Count) to upload"
        }
+
+       return $manifestKeys
+}
+
+# Pulls files over the size limit out of $folder so the /compress pass never sees them
+function Move-LargeFiles
+{
+       param([string] $folder)
+
+       foreach ($file in @(Get-ChildItem -LiteralPath $folder -File))
+       {
+              if ($file.Length -gt $largeFileThreshold)
+              {
+                     Write-Host ("Too large for symstore compression, handling separately: $($file.Name) ({0:N0} bytes)" -f $file.Length)
+                     Move-Item -LiteralPath $file.FullName -Destination (Join-Path $largeFolder $file.Name) -Force
+              }
+       }
+}
+
+# Copy symbols from the source directory
+Reset-Folder $symbolsFolder
+Reset-Folder $binFolder
+
+$pdbSearchPaths = if ($null -eq $pdbPaths) { @($localSourceDir) } else { $pdbPaths }
+$collectedPdbs = Copy-SymbolFiles -sourcePaths $pdbSearchPaths -destination $symbolsFolder -excludeNames $excludePdbNames -filters @('*.pdb') -kind "pdb's"
+
+$collectedBins = 0
+
+if ($null -ne $binPaths)
+{
+       $collectedBins = Copy-SymbolFiles -sourcePaths $binPaths -destination $binFolder -excludeNames $excludeBinNames -filters @('*.exe', '*.dll', '*.node') -kind "binaries"
+}
+
+# Pdb's and binaries are looked up separately, so a rerun where the pdb's are already stored still
+# uploads binaries that are not
+$uploadManifest = @()
+
+if ($forceUpload)
+{
+       Write-Host "-forceUpload set, skipping the symbol store lookup"
+}
+else
+{
+       $uploadManifest += Remove-StoredSymbols -folder $symbolsFolder
+       $uploadManifest += Remove-StoredSymbols -folder $binFolder
 }
 
 $remaining = @(Get-ChildItem -LiteralPath $symbolsFolder -Filter *.pdb -File -ErrorAction SilentlyContinue)
+$remainingBins = @(Get-ChildItem -LiteralPath $binFolder -File -ErrorAction SilentlyContinue)
 
-if ($remaining.Count -eq 0)
+if ($remaining.Count -eq 0 -and $remainingBins.Count -eq 0)
 {
-       if ($collectedAny)
+       if ($collectedPdbs -gt 0 -or $collectedBins -gt 0)
        {
-              Write-Host "Nothing to upload, the symbol store already has every pdb from this build."
+              Write-Host "Nothing to upload, the symbol store already has every pdb and binary from this build."
        }
        else
        {
-              Write-Warning "No pdb files were found to upload."
+              Write-Warning "No pdb or binary files were found to upload."
        }
 
        Remove-Item -LiteralPath $symbolsFolder -Recurse -Force -ErrorAction SilentlyContinue
+       Remove-Item -LiteralPath $binFolder -Recurse -Force -ErrorAction SilentlyContinue
        exit 0
 }
 
-# Edit the pdb's with http addresses
-$indexerArgs = @{
-       ignoreUnknown = $true
-       ignore = $ignoreArray
-       sourcesroot = $localSourceDir
-       dbgToolsPath = $dbgToolsPath
-       symbolsFolder = $symbolsFolder
-       userId = $repo_userId
-       repository = $repo_name
-       branch = $repo_branch
-       subModules = $subModules_ArrayArray
-}
-
-if ($isDebug)
-{
-       $indexerArgs['Verbose'] = $true
-}
-
-.\github-sourceindexer.ps1 @indexerArgs
-
-# Hold the oversized pdb's back from the /compress pass; they get compressed further down
 Reset-Folder $outputFolder
 Reset-Folder $largeFolder
 
-foreach ($pdb in @(Get-ChildItem -LiteralPath $symbolsFolder -Filter *.pdb -File))
+if ($remaining.Count -gt 0)
 {
-       if ($pdb.Length -gt $largePdbThreshold)
-       {
-              Write-Host ("Too large for symstore compression, handling separately: $($pdb.Name) ({0:N0} bytes)" -f $pdb.Length)
-              Move-Item -LiteralPath $pdb.FullName -Destination (Join-Path $largeFolder $pdb.Name) -Force
+       # Edit the pdb's with http addresses
+       $indexerArgs = @{
+              ignoreUnknown = $true
+              ignore = $ignoreArray
+              sourcesroot = $localSourceDir
+              dbgToolsPath = $dbgToolsPath
+              symbolsFolder = $symbolsFolder
+              userId = $repo_userId
+              repository = $repo_name
+              branch = $repo_branch
+              subModules = $subModules_ArrayArray
        }
+
+       if ($isDebug)
+       {
+              $indexerArgs['Verbose'] = $true
+       }
+
+       .\github-sourceindexer.ps1 @indexerArgs
 }
+
+# Hold the oversized files back from the /compress pass; they get compressed further down
+Move-LargeFiles -folder $symbolsFolder
+Move-LargeFiles -folder $binFolder
 
 # Run symstore on all of the .pdb's
 if (@(Get-ChildItem -LiteralPath $symbolsFolder -Filter *.pdb -File).Count -gt 0)
@@ -599,12 +658,24 @@ if (@(Get-ChildItem -LiteralPath $symbolsFolder -Filter *.pdb -File).Count -gt 0
        }
 }
 
-# The oversized ones go in uncompressed so symstore works out the key and builds the folder, then
-# each is compressed in place. A pdb left behind here would never be asked for by that name once
-# a .pd_ is expected, so a makecab failure has to stop the run rather than upload half a store.
-$largePdbs = @(Get-ChildItem -LiteralPath $largeFolder -Filter *.pdb -File)
+# Binaries are stored as they are - no source indexing, they carry no srcsrv stream
+if (@(Get-ChildItem -LiteralPath $binFolder -File).Count -gt 0)
+{
+       & $symStorePath add /compress /r /f $binFolder /s $outputFolder /t SLOBS
 
-if ($largePdbs.Count -gt 0)
+       if ($LASTEXITCODE -ne 0)
+       {
+              Write-Warning "symstore returned $LASTEXITCODE"
+       }
+}
+
+# The oversized ones go in uncompressed so symstore works out the key and builds the folder, then
+# each is compressed in place. A file left behind here would never be asked for by that name once
+# a compressed one is expected, so a makecab failure has to stop the run rather than upload half a
+# store.
+$largeFiles = @(Get-ChildItem -LiteralPath $largeFolder -File)
+
+if ($largeFiles.Count -gt 0)
 {
        & $symStorePath add /r /f $largeFolder /s $outputFolder /t SLOBS
 
@@ -613,7 +684,7 @@ if ($largePdbs.Count -gt 0)
               Write-Warning "symstore returned $LASTEXITCODE"
        }
 
-       foreach ($large in $largePdbs)
+       foreach ($large in $largeFiles)
        {
               # Nothing downstream looks at these by name, so an empty result here would drop the
               # symbol from the upload without anything else noticing
@@ -628,7 +699,7 @@ if ($largePdbs.Count -gt 0)
               foreach ($file in $stored)
               {
                      Write-Host "Compressing $($file.Name) with makecab"
-                     $failure = Compress-StorePdb -storedPdb $file.FullName
+                     $failure = Compress-StoreFile -storedFile $file.FullName
 
                      if ($failure)
                      {
@@ -639,11 +710,12 @@ if ($largePdbs.Count -gt 0)
        }
 }
 
-$cabs = @(Get-ChildItem -LiteralPath $outputFolder -Filter *.pd_ -Recurse -File -ErrorAction SilentlyContinue)
+# symstore replaces the last character of the extension with an underscore: .pd_, .ex_, .dl_, .nod_
+$cabs = @(Get-ChildItem -LiteralPath $outputFolder -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -like '.*_' })
 
 if ($cabs.Count -eq 0)
 {
-       Write-Error "symstore produced no compressed symbols from $($remaining.Count) pdb's"
+       Write-Error "symstore produced no compressed symbols from $($remaining.Count + $remainingBins.Count) pdb's and binaries"
        exit 1
 }
 
@@ -685,6 +757,7 @@ try
        # Cleanup
        Remove-Item -LiteralPath $outputFolder -Recurse -Force -ErrorAction SilentlyContinue
        Remove-Item -LiteralPath $symbolsFolder -Recurse -Force -ErrorAction SilentlyContinue
+       Remove-Item -LiteralPath $binFolder -Recurse -Force -ErrorAction SilentlyContinue
        Remove-Item -LiteralPath $largeFolder -Recurse -Force -ErrorAction SilentlyContinue
 }
 catch
@@ -693,6 +766,7 @@ catch
 
        Remove-Item -LiteralPath $outputFolder -Recurse -Force -ErrorAction SilentlyContinue
        Remove-Item -LiteralPath $symbolsFolder -Recurse -Force -ErrorAction SilentlyContinue
+       Remove-Item -LiteralPath $binFolder -Recurse -Force -ErrorAction SilentlyContinue
        Remove-Item -LiteralPath $largeFolder -Recurse -Force -ErrorAction SilentlyContinue
 
        # Run the failure upward to the calling script if there is one
