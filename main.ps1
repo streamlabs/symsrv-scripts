@@ -387,7 +387,8 @@ function Get-PresentSymbolKeys
               [int] $timeoutSeconds = 20
        )
 
-       $present = @{}
+       # S3 keys are case sensitive; a default hashtable would let Foo.dll vouch for foo.dll
+       $present = [System.Collections.Hashtable]::new([System.StringComparer]::Ordinal)
 
        if ($keys.Count -eq 0)
        {
@@ -703,9 +704,11 @@ if ($largeFiles.Count -gt 0)
 {
        & $symStorePath add /r /f $largeFolder /s $outputFolder /t SLOBS
 
+       # A partial store would pass the by-name check below while the manifest lists the missing versions
        if ($LASTEXITCODE -ne 0)
        {
-              Write-Warning "symstore returned $LASTEXITCODE"
+              Write-Error "symstore returned $LASTEXITCODE for the oversized files"
+              exit 1
        }
 
        # The lookup is by name and compresses every store entry of that name, so once per name
