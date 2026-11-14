@@ -140,9 +140,10 @@ function Reset-Folder
        New-Item -ItemType Directory -Path $path -Force | Out-Null
 }
 
-# Flattens every file matching $filters under $sourcePaths into $destination. Names have to be
-# unique in the store folder, so a second file with the same name wins - which is fine as long as
-# it is not silent.
+# Flattens every file matching $filters under $sourcePaths into $destination. Without
+# -keepCollisions a second file with the same name wins, which is fine as long as it is not silent.
+# With it, each repeat goes into its own numbered subfolder: same-named binaries are different
+# files with different store keys.
 function Copy-SymbolFiles
 {
        param(
@@ -150,7 +151,8 @@ function Copy-SymbolFiles
               [string] $destination,
               [string[]] $excludeNames,
               [string[]] $filters,
-              [string] $kind
+              [string] $kind,
+              [switch] $keepCollisions
        )
 
        $seen = @{}
@@ -191,13 +193,25 @@ function Copy-SymbolFiles
                             continue
                      }
 
+                     $target = $destination
+
                      if ($seen.ContainsKey($file.Name))
                      {
                             $collisions++
-                            Write-Warning "$kind name collision: '$($file.FullName)' overwrites '$($seen[$file.Name])'"
+
+                            if ($keepCollisions)
+                            {
+                                   $target = Join-Path $destination $collisions
+                                   New-Item -ItemType Directory -Path $target -Force | Out-Null
+                                   Write-Warning "$kind name collision: '$($file.FullName)' kept next to '$($seen[$file.Name])'"
+                            }
+                            else
+                            {
+                                   Write-Warning "$kind name collision: '$($file.FullName)' overwrites '$($seen[$file.Name])'"
+                            }
                      }
 
-                     Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $destination $file.Name) -Force
+                     Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $target $file.Name) -Force
                      $seen[$file.Name] = $file.FullName
                      $copied++
               }
@@ -330,15 +344,18 @@ function Get-SymbolStoreEntries
                             continue
                      }
 
+                     # FileName is relative to the folder, which matters for files in subfolders
                      $fileName = $matches['file']
                      $storePath = $matches['store']
                      $guid = $storePath.Substring($storePath.LastIndexOf('\') + 1)
+                     $leaf = Split-Path -Leaf $fileName
 
                      $entries += [pscustomobject]@{
                             FileName = $fileName
+                            StoreName = $leaf
                             Guid = $guid
                             # symstore names the compressed copy by replacing the last character of the extension
-                            CompressedName = $fileName.Substring(0, $fileName.Length - 1) + '_'
+                            CompressedName = $leaf.Substring(0, $leaf.Length - 1) + '_'
                      }
               }
        }
@@ -531,12 +548,12 @@ function Remove-StoredSymbols
                      Remove-Item -LiteralPath (Join-Path $folder $entry.FileName) -Force -ErrorAction SilentlyContinue
               }
 
-              $keys = @($usable | ForEach-Object { "$storePrefix/$($_.FileName)/$($_.Guid)/$($_.CompressedName)" })
+              $keys = @($usable | ForEach-Object { "$storePrefix/$($_.StoreName)/$($_.Guid)/$($_.CompressedName)" })
               $present = Get-PresentSymbolKeys -keys $keys -bucket $storeBucket -region $storeRegion
 
               foreach ($entry in $usable)
               {
-                     $key = "$storePrefix/$($entry.FileName)/$($entry.Guid)/$($entry.CompressedName)"
+                     $key = "$storePrefix/$($entry.StoreName)/$($entry.Guid)/$($entry.CompressedName)"
 
                      if ($present.ContainsKey($key))
                      {
@@ -555,17 +572,22 @@ function Remove-StoredSymbols
        return $manifestKeys
 }
 
-# Pulls files over the size limit out of $folder so the /compress pass never sees them
+# Pulls files over the size limit out of $folder so the /compress pass never sees them. The path
+# relative to $folder is kept, as same-named binaries live in subfolders.
 function Move-LargeFiles
 {
        param([string] $folder)
 
-       foreach ($file in @(Get-ChildItem -LiteralPath $folder -File))
+       foreach ($file in @(Get-ChildItem -LiteralPath $folder -File -Recurse))
        {
               if ($file.Length -gt $largeFileThreshold)
               {
-                     Write-Host ("Too large for symstore compression, handling separately: $($file.Name) ({0:N0} bytes)" -f $file.Length)
-                     Move-Item -LiteralPath $file.FullName -Destination (Join-Path $largeFolder $file.Name) -Force
+                     $relative = $file.FullName.Substring($folder.Length).TrimStart('\')
+                     $destination = Join-Path $largeFolder $relative
+                     New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+
+                     Write-Host ("Too large for symstore compression, handling separately: $relative ({0:N0} bytes)" -f $file.Length)
+                     Move-Item -LiteralPath $file.FullName -Destination $destination -Force
               }
        }
 }
@@ -581,7 +603,7 @@ $collectedBins = 0
 
 if ($null -ne $binPaths)
 {
-       $collectedBins = Copy-SymbolFiles -sourcePaths $binPaths -destination $binFolder -excludeNames $excludeBinNames -filters @('*.exe', '*.dll', '*.node') -kind "binaries"
+       $collectedBins = Copy-SymbolFiles -sourcePaths $binPaths -destination $binFolder -excludeNames $excludeBinNames -filters @('*.exe', '*.dll', '*.node') -kind "binaries" -keepCollisions
 }
 
 # Pdb's and binaries are looked up separately, so a rerun where the pdb's are already stored still
@@ -599,7 +621,7 @@ else
 }
 
 $remaining = @(Get-ChildItem -LiteralPath $symbolsFolder -Filter *.pdb -File -ErrorAction SilentlyContinue)
-$remainingBins = @(Get-ChildItem -LiteralPath $binFolder -File -ErrorAction SilentlyContinue)
+$remainingBins = @(Get-ChildItem -LiteralPath $binFolder -File -Recurse -ErrorAction SilentlyContinue)
 
 if ($remaining.Count -eq 0 -and $remainingBins.Count -eq 0)
 {
@@ -659,13 +681,15 @@ if (@(Get-ChildItem -LiteralPath $symbolsFolder -Filter *.pdb -File).Count -gt 0
 }
 
 # Binaries are stored as they are - no source indexing, they carry no srcsrv stream
-if (@(Get-ChildItem -LiteralPath $binFolder -File).Count -gt 0)
+if (@(Get-ChildItem -LiteralPath $binFolder -File -Recurse).Count -gt 0)
 {
        & $symStorePath add /compress /r /f $binFolder /s $outputFolder /t SLOBS
 
+       # The manifest already lists these keys, so carrying on would record binaries that were never stored
        if ($LASTEXITCODE -ne 0)
        {
-              Write-Warning "symstore returned $LASTEXITCODE"
+              Write-Error "symstore returned $LASTEXITCODE for the binaries"
+              exit 1
        }
 }
 
@@ -673,7 +697,7 @@ if (@(Get-ChildItem -LiteralPath $binFolder -File).Count -gt 0)
 # each is compressed in place. A file left behind here would never be asked for by that name once
 # a compressed one is expected, so a makecab failure has to stop the run rather than upload half a
 # store.
-$largeFiles = @(Get-ChildItem -LiteralPath $largeFolder -File)
+$largeFiles = @(Get-ChildItem -LiteralPath $largeFolder -File -Recurse)
 
 if ($largeFiles.Count -gt 0)
 {
@@ -684,7 +708,8 @@ if ($largeFiles.Count -gt 0)
               Write-Warning "symstore returned $LASTEXITCODE"
        }
 
-       foreach ($large in $largeFiles)
+       # The lookup is by name and compresses every store entry of that name, so once per name
+       foreach ($large in @($largeFiles | Sort-Object Name -Unique))
        {
               # Nothing downstream looks at these by name, so an empty result here would drop the
               # symbol from the upload without anything else noticing

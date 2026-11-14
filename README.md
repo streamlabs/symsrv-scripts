@@ -32,7 +32,9 @@ the same reason. Add more with **-excludePdbNames** (accepts wildcards, e.g. `'m
 Pass **-binPaths** (comma separated, searched recursively) to also store the `.exe`, `.dll` and
 `.node` files from those folders. Without it no binaries are uploaded. A debugger needs the binary
 itself to unwind a minidump, and the store key is `name\<TimeDateStamp><SizeOfImage>`, which is
-what symstore writes for a PE. Binaries are not source indexed.
+what symstore writes for a PE. Binaries are not source indexed. Same-named binaries from different
+folders (x86 and x64 builds, say) are all kept, since each has its own key. A failing symstore
+pass over the binaries stops the run.
 
 Pdb's and binaries are looked up in the bucket separately, so a rerun where every pdb is already
 stored still uploads the binaries that are missing. Third-party binaries in those folders (libcef,
